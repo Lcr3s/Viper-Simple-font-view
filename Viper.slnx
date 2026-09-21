@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Viper.vcxproj" Id="ada96021-f9b7-4e42-b50b-ccd191993cc6" />
+</Solution>
