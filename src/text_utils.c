@@ -87,26 +87,25 @@ int WrapLine(const char* buf, int start, int end,
     int segBegin = start;
     int lastSpace = -1;
 
+    static char tmp[65536];
+
     for (int i = start; i < end; ++i) {
         if (buf[i] == ' ') lastSpace = i;
 
-        // 测量 segBegin 到 i+1 的宽度
         int len = i + 1 - segBegin;
-        if (len > 511) len = 511;
+        if (len > 65535) len = 65535;
 
-        char tmp[512];
         memcpy(tmp, buf + segBegin, len);
         tmp[len] = '\0';
 
         Vector2 sz = MeasureTextEx(font, tmp, fontSize, 2);
         if (sz.x > maxWidth && segBegin < i) {
-            // 超宽，折行
             int breakAt;
             if (lastSpace > segBegin) {
-                breakAt = lastSpace;   // 在空格处折
+                breakAt = lastSpace;
             }
             else {
-                breakAt = i;           // 无处可折，强制在当前位置折
+                breakAt = i;
             }
 
             if (segs < maxSegs) {

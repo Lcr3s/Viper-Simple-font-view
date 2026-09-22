@@ -41,7 +41,7 @@ static int IsFontFile(const char* path) {
 #define MAX_CODEPOINTS    (128 + 3500)
 #define SPLITTER_WIDTH    8
 #define SCROLLBAR_WIDTH   12
-#define SCROLLBAR_MIN_H   30
+#define SCROLLBAR_MIN_H   20
 #define GAP               20
 
 static int gCodepoints[MAX_CODEPOINTS];
@@ -69,12 +69,10 @@ int main() {
     luaL_openlibs(L);
     luaL_dostring(L, "print('Input')");
 
-    // ---- 读设置 ----
     Settings settings;
     SettingsLoad(&settings);
     float darkAnim = (float)settings.dark;
 
-    // ---- 加载 UI 字体 ----
     Font uiFont;
     int  uiFontIsDefault = 1;
     if (settings.uiFont[0] != '\0' && IsFontFile(settings.uiFont)) {
@@ -93,7 +91,6 @@ int main() {
         uiFont = GetFontDefault();
     }
 
-    // ---- 加载图标 ----
     Texture2D iconFolder = LoadTexture("icons/folder-symlink.png");
     Texture2D iconEraser = LoadTexture("icons/eraser.png");
     Texture2D iconSettings = LoadTexture("icons/settings.png");
@@ -103,9 +100,6 @@ int main() {
     SetTextureFilter(iconEraser, TEXTURE_FILTER_BILINEAR);
     SetTextureFilter(iconSettings, TEXTURE_FILTER_BILINEAR);
     SetTextureFilter(iconX, TEXTURE_FILTER_BILINEAR);
-
-    printf("Icons: folder=%u, eraser=%u, settings=%u, x=%u\n",
-        iconFolder.id, iconEraser.id, iconSettings.id, iconX.id);
 
     char selectedFontPath[512] = "";
 
@@ -131,6 +125,10 @@ int main() {
 
     float splitRatio = 0.65f;
     int draggingSplitter = 0;
+    float previewScrollY = 0.0f;
+    int   draggingPreviewThumb = 0;
+    float previewThumbDragStartY = 0;
+    float previewThumbDragStartScroll = 0;
 
     int draggingListThumb = 0;
     float listThumbDragStartY = 0;
@@ -153,10 +151,7 @@ int main() {
 
 #define RELOAD_PREVIEW_FONT(path) do { \
         if (previewFontLoaded) { UnloadFont(previewFont); previewFontLoaded = 0; } \
-        printf("Loading font: %s\n", (path)); \
         previewFont = LoadFontEx((path), loadFontSize, gCodepoints, gCodepointCount); \
-        printf("  texture.id=%u, glyphCount=%d, baseSize=%d\n", \
-               previewFont.texture.id, previewFont.glyphCount, previewFont.baseSize); \
         if (previewFont.texture.id != 0) { \
             SetTextureFilter(previewFont.texture, TEXTURE_FILTER_BILINEAR); \
             previewFontLoaded = 1; \
@@ -205,11 +200,22 @@ int main() {
         if (previewW < 200) { previewW = 200; listW = usableW - previewW; }
 
         Rectangle previewBox = { contentX, previewTop, previewW, totalH };
+        Rectangle previewContent = {
+            previewBox.x,
+            previewBox.y,
+            previewBox.width - SCROLLBAR_WIDTH - 4,
+            previewBox.height
+        };
+        Rectangle previewScrollTrack = {
+            previewBox.x + previewBox.width - SCROLLBAR_WIDTH - 2,
+            previewBox.y + 2,
+            SCROLLBAR_WIDTH,
+            previewBox.height - 4
+        };
 
         float listX = contentX + previewW + GAP;
         float listY = previewTop;
 
-        // 搜索框（只有输入区 + × 按钮）
         Rectangle searchClearBtn = {
             listX + listW - SEARCH_BOX_HEIGHT,
             listY,
@@ -242,13 +248,26 @@ int main() {
             totalH
         };
 
+        Rectangle btnZoomIn = {
+            previewContent.x + previewContent.width - BTN_SIZE * 2 - 15,
+            previewContent.y + previewContent.height - BTN_SIZE - 10,
+            (float)BTN_SIZE, (float)BTN_SIZE
+        };
+        Rectangle btnZoomOut = {
+            previewContent.x + previewContent.width - BTN_SIZE - 10,
+            previewContent.y + previewContent.height - BTN_SIZE - 10,
+            (float)BTN_SIZE, (float)BTN_SIZE
+        };
+
         bool hoverPreview = CheckCollisionPointRec(mouse, previewBox);
         bool hoverList = CheckCollisionPointRec(mouse, listBox);
         bool hoverSearch = CheckCollisionPointRec(mouse, searchBox);
         bool hoverSearchClear = CheckCollisionPointRec(mouse, searchClearBtn);
         bool hoverSplitter = CheckCollisionPointRec(mouse, splitter);
+        bool hoverZoomIn = CheckCollisionPointRec(mouse, btnZoomIn);
+        bool hoverZoomOut = CheckCollisionPointRec(mouse, btnZoomOut);
 
-        // ---- 设置面板布局 ----
+        // ---- 设置面板 ----
 #define PANEL_W 320
 #define PANEL_H 260
         Rectangle settingsPanel = { 0, 0, 0, 0 };
@@ -275,7 +294,7 @@ int main() {
 
         hoverPanel = settingsOpen && CheckCollisionPointRec(mouse, settingsPanel);
 
-        // ---- 是否需要滚动条 ----
+        // ---- 列表滚动条 ----
         float listContentH = visibleCount * LIST_ITEM_HEIGHT;
         int needScrollbar = (listContentH > listAreaH);
 
@@ -298,13 +317,56 @@ int main() {
         bool hoverListThumb = needScrollbar &&
             CheckCollisionPointRec(mouse, listThumb);
 
+        // ---- 预览框 ----
+        Font useFont = previewFontLoaded ? previewFont : GetFontDefault();
+        float lineH = (float)previewFontSize + LINE_SPACING;
+        float maxTextW = previewContent.width - TEXT_LEFT_PAD * 2;
+
+        int previewLineStart[64], previewLineEnd[64];
+        int previewLines = SplitLines(inputBuffer, inputLength,
+            previewLineStart, previewLineEnd, 64);
+
+        float previewContentH = 0;
+        for (int i = 0; i < previewLines; ++i) {
+            int ls = previewLineStart[i];
+            int le = previewLineEnd[i];
+            if (ls == le) { previewContentH += lineH; continue; }
+            int ss[64], se[64];
+            int segs = WrapLine(inputBuffer, ls, le,
+                                useFont, (float)previewFontSize, maxTextW,
+                                ss, se, 64);
+            previewContentH += segs * lineH;
+        }
+        float previewVisibleH = previewContent.height - TEXT_TOP_PAD;
+        if (previewVisibleH < 0) previewVisibleH = 0;
+
+        int previewNeedScrollbar = (previewContentH > previewVisibleH);
+        float previewMaxScroll = previewContentH - previewVisibleH;
+        if (previewMaxScroll < 0) previewMaxScroll = 0;
+        if (previewScrollY > previewMaxScroll) previewScrollY = previewMaxScroll;
+        if (previewScrollY < 0) previewScrollY = 0;
+
+        Rectangle previewThumb = { 0, 0, 0, 0 };
+        if (previewNeedScrollbar) {
+            float thumbH = previewScrollTrack.height * (previewVisibleH / previewContentH);
+            if (thumbH < SCROLLBAR_MIN_H) thumbH = SCROLLBAR_MIN_H;
+            if (thumbH > previewScrollTrack.height) thumbH = previewScrollTrack.height;
+
+            float scrollRatio = (previewMaxScroll > 0) ? (previewScrollY / previewMaxScroll) : 0;
+            float thumbTravel = previewScrollTrack.height - thumbH;
+            float thumbY = previewScrollTrack.y + scrollRatio * thumbTravel;
+
+            previewThumb = (Rectangle){
+                previewScrollTrack.x, thumbY,
+                SCROLLBAR_WIDTH, thumbH
+            };
+        }
+        bool hoverPreviewThumb = previewNeedScrollbar &&
+            CheckCollisionPointRec(mouse, previewThumb);
+
         // ---- 拖动分隔条 ----
-        if (hoverSplitter && mousePressed) {
-            draggingSplitter = 1;
-        }
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            draggingSplitter = 0;
-        }
+        if (hoverSplitter && mousePressed) draggingSplitter = 1;
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) draggingSplitter = 0;
         if (draggingSplitter && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             float newPreviewW = mouse.x - contentX;
             splitRatio = newPreviewW / usableW;
@@ -312,15 +374,13 @@ int main() {
             if (splitRatio > 0.8f) splitRatio = 0.8f;
         }
 
-        // ---- 拖动列表滚动条滑块 ----
+        // ---- 拖动列表滚动条 ----
         if (hoverListThumb && mousePressed) {
             draggingListThumb = 1;
             listThumbDragStartY = mouse.y;
             listThumbDragStartScroll = fontListScroll;
         }
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            draggingListThumb = 0;
-        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) draggingListThumb = 0;
         if (draggingListThumb && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             float delta = mouse.y - listThumbDragStartY;
             float maxScroll = listContentH - listAreaH;
@@ -334,6 +394,25 @@ int main() {
             }
         }
 
+        // ---- 拖动预览滚动条 ----
+        if (hoverPreviewThumb && mousePressed) {
+            draggingPreviewThumb = 1;
+            previewThumbDragStartY = mouse.y;
+            previewThumbDragStartScroll = previewScrollY;
+        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) draggingPreviewThumb = 0;
+        if (draggingPreviewThumb && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            float delta = mouse.y - previewThumbDragStartY;
+            float thumbTravel = previewScrollTrack.height - previewThumb.height;
+            if (thumbTravel > 0) {
+                float newScroll = previewThumbDragStartScroll
+                    + delta * previewMaxScroll / thumbTravel;
+                if (newScroll < 0) newScroll = 0;
+                if (newScroll > previewMaxScroll) newScroll = previewMaxScroll;
+                previewScrollY = newScroll;
+            }
+        }
+
         if (draggingSplitter || hoverSplitter) {
             SetMouseCursor(MOUSE_CURSOR_RESIZE_EW);
         }
@@ -341,11 +420,11 @@ int main() {
             SetMouseCursor(MOUSE_CURSOR_DEFAULT);
         }
 
-        // ---- 构建可见列表 ----
+        // ---- 可见列表 ----
         visibleCount = 0;
         for (int i = 0; i < fontListCount; ++i) {
-            const char* target = BaseName(fontList[i]);
-            if (searchLength == 0 || ContainsNoCase(target, searchBuffer)) {
+            const char* targetName = BaseName(fontList[i]);
+            if (searchLength == 0 || ContainsNoCase(targetName, searchBuffer)) {
                 visibleIdx[visibleCount++] = i;
             }
         }
@@ -357,7 +436,6 @@ int main() {
                 langDropdownOpen = 0;
             }
             else {
-                // 语言下拉
                 if (mousePressed && CheckCollisionPointRec(mouse, langBox)) {
                     langDropdownOpen = !langDropdownOpen;
                 }
@@ -378,13 +456,11 @@ int main() {
                     }
                 }
 
-                // 夜间开关
                 if (mousePressed && CheckCollisionPointRec(mouse, switchDark)) {
                     settings.dark = !settings.dark;
                     SettingsSave(&settings);
                 }
 
-                // 默认 UI 字体
                 if (mousePressed && CheckCollisionPointRec(mouse, rowFont)) {
                     char path[512] = "";
                     if (OpenFontFileDialog(path, sizeof(path))) {
@@ -407,7 +483,6 @@ int main() {
             }
         }
 
-        // ---- 点击设置按钮：开关面板 ----
         if (hoverSettings && mousePressed) {
             settingsOpen = !settingsOpen;
             if (!settingsOpen) langDropdownOpen = 0;
@@ -417,26 +492,30 @@ int main() {
         if (hoverOpenFolder && mousePressed) {
             char folder[512] = "";
             if (OpenFolderDialog(GetWindowHandle(), folder, sizeof(folder))) {
-                printf("Selected folder: %s\n", folder);
                 fontListCount = ScanFontsInFolder(folder, fontList, MAX_FONTS);
-                printf("Found %d fonts\n", fontListCount);
-                // 逐个读字体名
                 for (int i = 0; i < fontListCount; ++i) {
                     fontNames[i][0] = '\0';
-                    if (GetFontFamilyName(fontList[i], fontNames[i], 128)) {
-                        // 成功
-                    }
-                    else {
-                        // 失败（ttc 或不支持的格式），用文件名
+                    if (!GetFontFamilyName(fontList[i], fontNames[i], 128)) {
                         strncpy(fontNames[i], BaseName(fontList[i]), 127);
                         fontNames[i][127] = '\0';
                     }
                 }
                 fontListSelected = -1;
                 fontListScroll = 0.0f;
+                previewScrollY = 0.0f;
                 searchBuffer[0] = '\0';
                 searchLength = 0;
             }
+        }
+
+        // ---- 点击 + / − ----
+        if (hoverZoomIn && mousePressed) {
+            previewFontSize += FONT_SIZE_STEP;
+            if (previewFontSize > FONT_SIZE_MAX) previewFontSize = FONT_SIZE_MAX;
+        }
+        if (hoverZoomOut && mousePressed) {
+            previewFontSize -= FONT_SIZE_STEP;
+            if (previewFontSize < FONT_SIZE_MIN) previewFontSize = FONT_SIZE_MIN;
         }
 
         // ---- 点击列表项 ----
@@ -447,8 +526,8 @@ int main() {
                 int idx = visibleIdx[v];
                 fontListSelected = idx;
                 strcpy(selectedFontPath, fontList[idx]);
-                printf("List selected: %s\n", selectedFontPath);
                 RELOAD_PREVIEW_FONT(selectedFontPath);
+                previewScrollY = 0.0f;
                 inputFocused = 1;
             }
         }
@@ -459,14 +538,13 @@ int main() {
             inputFocused = 0;
         }
 
-        // ---- 点击搜索框清除按钮 ----
         if (hoverSearchClear && mousePressed) {
             searchBuffer[0] = '\0';
             searchLength = 0;
             searchFocused = 1;
         }
 
-        // ---- 列表滚动（滚轮）----
+        // ---- 滚轮 ----
         if (hoverList) {
             float wheel = GetMouseWheelMove();
             if (needScrollbar) {
@@ -476,45 +554,82 @@ int main() {
                 if (fontListScroll > maxScroll) fontListScroll = maxScroll;
             }
         }
+        else if (hoverPreview) {
+            float wheel = GetMouseWheelMove();
+            if (previewNeedScrollbar) {
+                previewScrollY -= wheel * 30.0f;
+                if (previewScrollY < 0) previewScrollY = 0;
+                if (previewScrollY > previewMaxScroll) previewScrollY = previewMaxScroll;
+            }
+        }
 
-        // ---- 点击预览框：聚焦 + 定位光标 ----
+        // ---- 点击预览框：视觉行版 ----
         if (hoverPreview && mousePressed) {
             inputFocused = 1;
             searchFocused = 0;
-            Font useFont = previewFontLoaded ? previewFont : GetFontDefault();
-            float textX = previewBox.x + TEXT_LEFT_PAD;
-            float textY = previewBox.y + TEXT_TOP_PAD;
-            float relY = mouse.y - textY;
 
-            int lineStart[64], lineEnd[64];
-            int lines = SplitLines(inputBuffer, inputLength,
-                lineStart, lineEnd, 64);
-            float lineH = (float)previewFontSize + LINE_SPACING;
-
-            int hitLine = (int)(relY / lineH);
-            if (hitLine < 0) hitLine = 0;
-            if (hitLine > lines - 1) hitLine = lines - 1;
-
-            int hitCol = 0;
+            float textX = previewContent.x + TEXT_LEFT_PAD;
+            float textY = previewContent.y + TEXT_TOP_PAD;
+            float relY = mouse.y - textY + previewScrollY;
             float relX = mouse.x - textX;
             if (relX < 0) relX = 0;
 
-            for (int c = lineStart[hitLine]; c <= lineEnd[hitLine]; ++c) {
-                int plen = c - lineStart[hitLine];
+            int foundSegStart = 0;
+            int foundSegEnd = 0;
+            int found = 0;
+            float curY = 0;
+
+            for (int i = 0; i < previewLines; ++i) {
+                int ls2 = previewLineStart[i];
+                int le2 = previewLineEnd[i];
+
+                if (ls2 == le2) {
+                    if (relY >= curY && relY < curY + lineH) {
+                        foundSegStart = ls2;
+                        foundSegEnd = le2;
+                        found = 1;
+                        break;
+                    }
+                    curY += lineH;
+                    continue;
+                }
+
+                int ss[64], se[64];
+                int segs = WrapLine(inputBuffer, ls2, le2,
+                                    useFont, (float)previewFontSize, maxTextW,
+                                    ss, se, 64);
+
+                for (int s = 0; s < segs; ++s) {
+                    if (relY >= curY && relY < curY + lineH) {
+                        foundSegStart = ss[s];
+                        foundSegEnd = se[s];
+                        found = 1;
+                        break;
+                    }
+                    curY += lineH;
+                }
+                if (found) break;
+            }
+
+            if (!found && previewLines > 0) {
+                foundSegStart = previewLineStart[previewLines - 1];
+                foundSegEnd = previewLineEnd[previewLines - 1];
+            }
+
+            int hitCol = 0;
+            for (int c = foundSegStart; c <= foundSegEnd; ++c) {
+                int plen = c - foundSegStart;
                 if (plen > 511) plen = 511;
                 char prefix[512];
-                memcpy(prefix, inputBuffer + lineStart[hitLine], plen);
+                memcpy(prefix, inputBuffer + foundSegStart, plen);
                 prefix[plen] = '\0';
                 float w = MeasureTextEx(useFont, prefix,
                     (float)previewFontSize, 2).x;
-                if (w > relX) {
-                    hitCol = plen;
-                    break;
-                }
+                if (w > relX) { hitCol = plen; break; }
                 hitCol = plen;
             }
 
-            cursorPos = lineStart[hitLine] + hitCol;
+            cursorPos = foundSegStart + hitCol;
             if (cursorPos > inputLength) cursorPos = inputLength;
         }
 
@@ -522,13 +637,15 @@ int main() {
             && !hoverPreview && !hoverOpenFolder
             && !hoverClear && !hoverList && !hoverSettings
             && !hoverSearch && !hoverSplitter
-            && !hoverSearchClear && !hoverListThumb)
+            && !hoverSearchClear && !hoverListThumb
+            && !hoverZoomIn && !hoverZoomOut
+            && !hoverPreviewThumb)
         {
             inputFocused = 0;
             searchFocused = 0;
         }
 
-        // ---- 清空按钮 ----
+        // ---- 清空 ----
         if (hoverClear && mousePressed) {
             if (previewFontLoaded) {
                 UnloadFont(previewFont);
@@ -540,26 +657,18 @@ int main() {
             inputLength = 0;
             cursorPos = 0;
             inputFocused = 0;
-            //#fontListCount = 0;
-            //#fontListSelected = -1;
-            //#fontListScroll = 0.0f;
             searchBuffer[0] = '\0';
             searchLength = 0;
             searchFocused = 0;
-            printf("Cleared\n");
+            previewScrollY = 0.0f;
         }
 
-        // ---- 字号调整 ----
+        // ---- Ctrl +/- ----
         if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
             if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD))
                 previewFontSize += FONT_SIZE_STEP;
             if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT))
                 previewFontSize -= FONT_SIZE_STEP;
-        }
-        if (hoverPreview) {
-            float wheel = GetMouseWheelMove();
-            if (wheel > 0) previewFontSize += FONT_SIZE_STEP;
-            if (wheel < 0) previewFontSize -= FONT_SIZE_STEP;
         }
         if (previewFontSize < FONT_SIZE_MIN) previewFontSize = FONT_SIZE_MIN;
         if (previewFontSize > FONT_SIZE_MAX) previewFontSize = FONT_SIZE_MAX;
@@ -608,30 +717,9 @@ int main() {
                     }
                 }
             }
+
             int ch;
             while ((ch = GetCharPressed()) > 0) {
-                if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
-                    if (IsKeyPressed(KEY_C)) {
-                        if (inputLength > 0) ClipboardCopy(inputBuffer);
-                    }
-                    if (IsKeyPressed(KEY_V)) {
-                        char* clip = ClipboardPaste();
-                        if (clip) {
-                            int clipLen = (int)strlen(clip);
-                            for (int i = 0; i < clipLen; ++i) {
-                                if (clip[i] < 32 && clip[i] != '\n') continue;
-                                if (inputLength + 1 > 510) break;
-                                for (int j = inputLength; j > cursorPos; --j)
-                                    inputBuffer[j] = inputBuffer[j - 1];
-                                inputBuffer[cursorPos] = clip[i];
-                                ++inputLength;
-                                ++cursorPos;
-                                inputBuffer[inputLength] = '\0';
-                            }
-                            free(clip);
-                        }
-                    }
-                }
                 if (ch < 32) continue;
                 char utf8[5] = { 0 };
                 int n = EncodeUTF8(ch, utf8);
@@ -669,9 +757,8 @@ int main() {
                         doDelete = 1;
                     }
                 }
-                else {
-                    backspaceTimer = 0.0f;
-                }
+                else backspaceTimer = 0.0f;
+
                 if (doDelete && cursorPos > 0) {
                     int n = PrevUTF8CharLen(inputBuffer, cursorPos);
                     for (int i = cursorPos - n; i < inputLength - n; ++i)
@@ -682,26 +769,65 @@ int main() {
                 }
             }
 
-            if (IsKeyPressed(KEY_LEFT) && cursorPos > 0) {
+            if (IsKeyPressed(KEY_LEFT) && cursorPos > 0)
                 cursorPos -= PrevUTF8CharLen(inputBuffer, cursorPos);
-            }
-            if (IsKeyPressed(KEY_RIGHT) && cursorPos < inputLength) {
+            if (IsKeyPressed(KEY_RIGHT) && cursorPos < inputLength)
                 cursorPos += PrevUTF8CharLen(inputBuffer, cursorPos + 1);
-            }
 
             if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_DOWN)) {
-                int lineStart[64], lineEnd[64];
-                int lines = SplitLines(inputBuffer, inputLength,
-                    lineStart, lineEnd, 64);
                 int curLine, curCol;
-                GetLineCol(inputBuffer, cursorPos, lines,
-                    lineStart, lineEnd, &curLine, &curCol);
+                GetLineCol(inputBuffer, cursorPos, previewLines,
+                    previewLineStart, previewLineEnd, &curLine, &curCol);
                 int targetLine = curLine + (IsKeyPressed(KEY_DOWN) ? 1 : -1);
                 if (targetLine < 0) targetLine = 0;
-                if (targetLine > lines - 1) targetLine = lines - 1;
-                int lineLen = lineEnd[targetLine] - lineStart[targetLine];
+                if (targetLine > previewLines - 1) targetLine = previewLines - 1;
+                int lineLen = previewLineEnd[targetLine] - previewLineStart[targetLine];
                 int targetCol = curCol < lineLen ? curCol : lineLen;
-                cursorPos = lineStart[targetLine] + targetCol;
+                cursorPos = previewLineStart[targetLine] + targetCol;
+            }
+
+            // ---- 光标跟随滚动 ----
+            {
+                int cl, cc;
+                GetLineCol(inputBuffer, cursorPos, previewLines,
+                    previewLineStart, previewLineEnd, &cl, &cc);
+
+                int ls3 = previewLineStart[cl];
+                int le3 = previewLineEnd[cl];
+
+                int ss3[64], se3[64];
+                int segs3 = WrapLine(inputBuffer, ls3, le3,
+                                     useFont, (float)previewFontSize, maxTextW,
+                                     ss3, se3, 64);
+
+                int tp3 = ls3 + cc;
+                int ts3 = 0;
+                if (segs3 > 0) {
+                    for (int s = 0; s < segs3; ++s) {
+                        if (tp3 <= se3[s]) { ts3 = s; break; }
+                        ts3 = s;
+                    }
+                }
+
+                float careRelY = 0;
+                for (int i = 0; i < cl; ++i) {
+                    int ls4 = previewLineStart[i];
+                    int le4 = previewLineEnd[i];
+                    if (ls4 == le4) { careRelY += lineH; continue; }
+                    int ss4[64], se4[64];
+                    int segs4 = WrapLine(inputBuffer, ls4, le4,
+                                         useFont, (float)previewFontSize, maxTextW,
+                                         ss4, se4, 64);
+                    careRelY += segs4 * lineH;
+                }
+                careRelY += ts3 * lineH;
+
+                if (careRelY < previewScrollY)
+                    previewScrollY = careRelY;
+                if (careRelY + lineH > previewScrollY + previewVisibleH)
+                    previewScrollY = careRelY + lineH - previewVisibleH;
+                if (previewScrollY < 0) previewScrollY = 0;
+                if (previewScrollY > previewMaxScroll) previewScrollY = previewMaxScroll;
             }
         }
 
@@ -710,9 +836,7 @@ int main() {
         ClearBackground(T.bg);
 
         DrawTextEx(uiFont, "Viper: free simple font viewer",
-            (Vector2) {
-            (float)settingX, (float)settingY
-        },
+            (Vector2) { (float)settingX, (float)settingY },
             (float)settingSize, 2, T.text);
 
         Color colorOpen = hoverOpenFolder ? T.btnHover : T.bg;
@@ -722,20 +846,16 @@ int main() {
         DrawRectangleRec(btnClear, colorClear);
 
         DrawRectangleLinesEx(
-            (Rectangle) {
-            btnOpenFolder.x,
-                btnOpenFolder.y,
-                btnOpenFolder.width,
-                btnOpenFolder.height + btnClear.height
-        },
+            (Rectangle) { btnOpenFolder.x, btnOpenFolder.y,
+                          btnOpenFolder.width,
+                          btnOpenFolder.height + btnClear.height },
             2, T.border);
 
-        DrawLine(
-            (int)btnOpenFolder.x,
-            (int)(btnOpenFolder.y + btnOpenFolder.height),
-            (int)(btnOpenFolder.x + btnOpenFolder.width),
-            (int)(btnOpenFolder.y + btnOpenFolder.height),
-            T.border);
+        DrawLine((int)btnOpenFolder.x,
+                 (int)(btnOpenFolder.y + btnOpenFolder.height),
+                 (int)(btnOpenFolder.x + btnOpenFolder.width),
+                 (int)(btnOpenFolder.y + btnOpenFolder.height),
+                 T.border);
 
         DrawIcon(iconFolder, btnOpenFolder);
         DrawIcon(iconEraser, btnClear);
@@ -745,54 +865,37 @@ int main() {
         DrawRectangleLinesEx(btnSettings, 2, T.border);
         DrawIcon(iconSettings, btnSettings);
 
-        Color splitterColor = (draggingSplitter || hoverSplitter)
-            ? T.border
-            : T.inputBg;
+        Color splitterColor = (draggingSplitter || hoverSplitter) ? T.border : T.inputBg;
         DrawRectangleRec(splitter, splitterColor);
 
         Color boxBorder = inputFocused ? T.borderActive : T.border;
         DrawRectangleLinesEx(previewBox, 2, boxBorder);
 
-        Font useFont = previewFontLoaded ? previewFont : GetFontDefault();
-        float textX = previewBox.x + TEXT_LEFT_PAD;
-        float textY = previewBox.y + TEXT_TOP_PAD;
-        float lineH = (float)previewFontSize + LINE_SPACING;
+        float textX = previewContent.x + TEXT_LEFT_PAD;
+        float textY = previewContent.y + TEXT_TOP_PAD;
 
-        BeginScissorMode((int)previewBox.x, (int)previewBox.y,
-            (int)previewBox.width, (int)previewBox.height);
-
-        int lineStart[64], lineEnd[64];
-        int lines = SplitLines(inputBuffer, inputLength,
-            lineStart, lineEnd, 64);
+        BeginScissorMode((int)previewContent.x, (int)previewContent.y,
+            (int)previewContent.width, (int)previewContent.height);
 
         if (inputLength == 0) {
             const char* hint = previewFontLoaded
                 ? "Type here..."
                 : "Select a folder first (top-left button)";
-            DrawTextEx(uiFont, hint,
-                (Vector2) {
-                textX, textY
-            },
+            DrawTextEx(uiFont, hint, (Vector2) { textX, textY },
                 (float)previewFontSize, 2, T.textDim);
         }
         else {
-            float maxWidth = previewBox.width - TEXT_LEFT_PAD * 2;
-            float curY = textY;
+            float curY = textY - previewScrollY;
+            for (int i = 0; i < previewLines; ++i) {
+                int ls = previewLineStart[i];
+                int le = previewLineEnd[i];
 
-            for (int i = 0; i < lines; ++i) {
-                int ls = lineStart[i];
-                int le = lineEnd[i];
-
-                // 空行也要占一行
-                if (ls == le) {
-                    curY += lineH;
-                    continue;
-                }
+                if (ls == le) { curY += lineH; continue; }
 
                 int segStart[64], segEnd[64];
                 int segs = WrapLine(inputBuffer, ls, le,
-                    useFont, (float)previewFontSize, maxWidth,
-                    segStart, segEnd, 64);
+                                    useFont, (float)previewFontSize, maxTextW,
+                                    segStart, segEnd, 64);
 
                 for (int s = 0; s < segs; ++s) {
                     int len = segEnd[s] - segStart[s];
@@ -803,9 +906,7 @@ int main() {
                     lineBuf[len] = '\0';
 
                     DrawTextEx(useFont, lineBuf,
-                        (Vector2) {
-                        textX, curY
-                    },
+                        (Vector2) { textX, curY },
                         (float)previewFontSize, 2, T.text);
 
                     curY += lineH;
@@ -813,61 +914,45 @@ int main() {
             }
         }
 
+        // ---- 光标 ----
         if (inputFocused) {
-            float maxWidth = previewBox.width - TEXT_LEFT_PAD * 2;
-
-            // 1. 光标在原文的第几行、第几列
             int curLine, curCol;
-            GetLineCol(inputBuffer, cursorPos, lines,
-                lineStart, lineEnd, &curLine, &curCol);
+            GetLineCol(inputBuffer, cursorPos, previewLines,
+                previewLineStart, previewLineEnd, &curLine, &curCol);
 
-            // 2. 光标所在那行的起止
-            int ls = lineStart[curLine];
-            int le = lineEnd[curLine];
+            int ls = previewLineStart[curLine];
+            int le = previewLineEnd[curLine];
 
-            // 3. 对那行做 WrapLine
             int segStart[64], segEnd[64];
             int segs = WrapLine(inputBuffer, ls, le,
-                useFont, (float)previewFontSize, maxWidth,
-                segStart, segEnd, 64);
+                                useFont, (float)previewFontSize, maxTextW,
+                                segStart, segEnd, 64);
 
-            // 4. 光标绝对位置
             int targetPos = ls + curCol;
-
-            // 5. 找光标在第几个视觉段
             int targetSeg = 0;
             if (segs > 0) {
                 for (int s = 0; s < segs; ++s) {
-                    if (targetPos <= segEnd[s]) {
-                        targetSeg = s;
-                        break;
-                    }
+                    if (targetPos <= segEnd[s]) { targetSeg = s; break; }
                     targetSeg = s;
                 }
             }
 
-            // 6. 光标在段内的列
             int posInSeg = targetPos - segStart[targetSeg];
             if (posInSeg < 0) posInSeg = 0;
 
-            // 7. 算光标 Y：把光标之前的所有视觉行加起来
-            float curY = textY;
+            float curY = textY - previewScrollY;
             for (int i = 0; i < curLine; ++i) {
-                int ls2 = lineStart[i];
-                int le2 = lineEnd[i];
-                if (ls2 == le2) {
-                    curY += lineH;
-                    continue;
-                }
+                int ls2 = previewLineStart[i];
+                int le2 = previewLineEnd[i];
+                if (ls2 == le2) { curY += lineH; continue; }
                 int ss2[64], se2[64];
                 int segs2 = WrapLine(inputBuffer, ls2, le2,
-                    useFont, (float)previewFontSize, maxWidth,
-                    ss2, se2, 64);
+                                     useFont, (float)previewFontSize, maxTextW,
+                                     ss2, se2, 64);
                 curY += segs2 * lineH;
             }
             curY += targetSeg * lineH;
 
-            // 8. 光标 X：测前缀宽度
             char prefix[512];
             int plen = posInSeg;
             if (plen > 511) plen = 511;
@@ -888,21 +973,28 @@ int main() {
 
         EndScissorMode();
 
-        // ---- 左下角小框：用字体自身渲染字体名 ----
+        // ---- 预览框滚动条 ----
+        if (previewNeedScrollbar) {
+            DrawRectangleRec(previewScrollTrack, T.scrollTrack);
+            Color thumbColor = hoverPreviewThumb ? T.scrollThumbHover : T.scrollThumb;
+            DrawRectangleRec(previewThumb, thumbColor);
+        }
+
+        // ---- 左下角小框 ----
         if (previewFontLoaded && fontListSelected >= 0) {
             const char* name = fontNames[fontListSelected];
             if (name[0] == '\0') name = BaseName(fontList[fontListSelected]);
 
-            float nameFontSize = 32;
+            float nameFontSize = 44;
             Vector2 nameSize = MeasureTextEx(previewFont, name, nameFontSize, 2);
 
-            float boxW = nameSize.x + 24;
-            float boxH = 56;
+            float boxW = nameSize.x + 44;
+            float boxH = (float)56;
             if (boxW < 60) boxW = 60;
 
             Rectangle nameBox = {
-                previewBox.x + 10,
-                previewBox.y + previewBox.height - boxH - 10,
+                previewContent.x + 10,
+                previewContent.y + previewContent.height - boxH - 10,
                 boxW, boxH
             };
 
@@ -915,22 +1007,39 @@ int main() {
                 nameFontSize, 2, T.text);
         }
 
+        // ---- 右下角 + ----
+        DrawRectangleRec(btnZoomIn, hoverZoomIn ? T.btnHover : T.bg);
+        DrawRectangleLinesEx(btnZoomIn, 2, T.border);
+        {
+            float cx = btnZoomIn.x + btnZoomIn.width / 2;
+            float cy = btnZoomIn.y + btnZoomIn.height / 2;
+            float arm = 12;
+            DrawLineEx((Vector2) { cx - arm, cy }, (Vector2) { cx + arm, cy }, 3, T.text);
+            DrawLineEx((Vector2) { cx, cy - arm }, (Vector2) { cx, cy + arm }, 3, T.text);
+        }
+
+        // ---- 右下角 − ----
+        DrawRectangleRec(btnZoomOut, hoverZoomOut ? T.btnHover : T.bg);
+        DrawRectangleLinesEx(btnZoomOut, 2, T.border);
+        {
+            float cx = btnZoomOut.x + btnZoomOut.width / 2;
+            float cy = btnZoomOut.y + btnZoomOut.height / 2;
+            float arm = 12;
+            DrawLineEx((Vector2) { cx - arm, cy }, (Vector2) { cx + arm, cy }, 3, T.text);
+        }
+
         // ---- 搜索框 ----
         DrawRectangleRec(searchBox, searchFocused ? T.bg : T.inputBg);
         DrawRectangleLinesEx(searchBox, 2, searchFocused ? T.borderActive : T.border);
 
         if (searchLength == 0) {
             DrawTextEx(uiFont, "Search...",
-                (Vector2) {
-                searchBox.x + 10, searchBox.y + 8
-            },
+                (Vector2) { searchBox.x + 10, searchBox.y + 8 },
                 20, 2, T.textDim);
         }
         else {
             DrawTextEx(uiFont, searchBuffer,
-                (Vector2) {
-                searchBox.x + 10, searchBox.y + 8
-            },
+                (Vector2) { searchBox.x + 10, searchBox.y + 8 },
                 20, 2, T.text);
         }
 
@@ -943,9 +1052,7 @@ int main() {
             }
         }
 
-        // × 按钮
-        DrawRectangleRec(searchClearBtn,
-            hoverSearchClear ? T.btnHover : T.bg);
+        DrawRectangleRec(searchClearBtn, hoverSearchClear ? T.btnHover : T.bg);
         DrawRectangleLinesEx(searchClearBtn, 2, T.border);
         DrawIcon(iconX, searchClearBtn);
 
@@ -969,10 +1076,8 @@ int main() {
 
             const char* display = BaseName(fontList[i]);
             DrawTextEx(uiFont, display,
-                (Vector2) {
-                itemRect.x + 8,
-                    itemRect.y + (LIST_ITEM_HEIGHT - 28) / 2.0f
-            },
+                (Vector2) { itemRect.x + 8,
+                            itemRect.y + (LIST_ITEM_HEIGHT - 28) / 2.0f },
                 28, 2, T.text);
         }
 
@@ -980,9 +1085,7 @@ int main() {
 
         if (needScrollbar) {
             DrawRectangleRec(scrollTrack, T.scrollTrack);
-            Color thumbColor = hoverListThumb
-                ? T.scrollThumbHover
-                : T.scrollThumb;
+            Color thumbColor = hoverListThumb ? T.scrollThumbHover : T.scrollThumb;
             DrawRectangleRec(listThumb, thumbColor);
         }
 
@@ -992,23 +1095,17 @@ int main() {
             DrawRectangleLinesEx(settingsPanel, 2, T.border);
 
             DrawTextEx(uiFont, "Settings",
-                (Vector2) {
-                settingsPanel.x + 16, settingsPanel.y + 12
-            },
+                (Vector2) { settingsPanel.x + 16, settingsPanel.y + 12 },
                 20, 2, T.text);
 
             DrawTextEx(uiFont, "Language",
-                (Vector2) {
-                rowLang.x, rowLang.y + 8
-            },
+                (Vector2) { rowLang.x, rowLang.y + 8 },
                 18, 2, T.text);
             DrawRectangleRec(langBox, T.inputBg);
             DrawRectangleLinesEx(langBox, 2, T.border);
             const char* langNames[2] = { "中文", "English" };
             DrawTextEx(uiFont, langNames[settings.language],
-                (Vector2) {
-                langBox.x + 8, langBox.y + 8
-            },
+                (Vector2) { langBox.x + 8, langBox.y + 8 },
                 18, 2, T.text);
 
             if (langDropdownOpen) {
@@ -1023,9 +1120,7 @@ int main() {
             }
 
             DrawTextEx(uiFont, "Dark Mode",
-                (Vector2) {
-                rowDark.x, rowDark.y + 8
-            },
+                (Vector2) { rowDark.x, rowDark.y + 8 },
                 18, 2, T.text);
             Color switchBg = settings.dark ? T.switchBgOn : T.switchBgOff;
             DrawRectangleRec(switchDark, switchBg);
@@ -1040,15 +1135,11 @@ int main() {
             DrawRectangle((int)knobX, (int)knobY, (int)knobW, (int)knobH, T.switchKnob);
 
             DrawTextEx(uiFont, "UI Font",
-                (Vector2) {
-                rowFont.x, rowFont.y + 8
-            },
+                (Vector2) { rowFont.x, rowFont.y + 8 },
                 18, 2, T.text);
             const char* fontLabel = settings.uiFont[0] ? "Custom" : "Default";
             DrawTextEx(uiFont, fontLabel,
-                (Vector2) {
-                rowFont.x + rowFont.width - 80, rowFont.y + 8
-            },
+                (Vector2) { rowFont.x + rowFont.width - 80, rowFont.y + 8 },
                 18, 2, T.textDim);
         }
 
@@ -1061,10 +1152,7 @@ int main() {
     UnloadTexture(iconSettings);
     UnloadTexture(iconX);
 
-    if (!uiFontIsDefault && uiFont.texture.id != 0) {
-        UnloadFont(uiFont);
-    }
-
+    if (!uiFontIsDefault && uiFont.texture.id != 0) UnloadFont(uiFont);
     if (previewFontLoaded) UnloadFont(previewFont);
     lua_close(L);
     CloseWindow();

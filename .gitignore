@@ -1,54 +1,24 @@
-# ===== Visual Studio =====
-.vs/
-*.vcxproj.user
-*.suo
-*.user
-*.sln.docstates
-
-# ===== 编译输出 =====
-build/
+# 编译产物
 x64/
 Debug/
 Release/
-[Bb]in/
-[Oo]bj/
-*.obj
-*.o
 *.exe
 *.dll
 *.lib
-*.a
-*.so
+*.obj
 *.pdb
 *.ilk
-*.exp
-*.idb
 *.log
 *.tlog
-*.lastbuildstate
-*.cache
+*.idb
+*.exp
 
-# ===== raylib 编译产物 =====
-*.raylib
-raylib.dll
-raylib.lib
-libraylib.a
+# VS 缓存
+.vs/
+*.user
+*.suo
 
-# ===== Lua 编译产物 =====
-*.luac
-luac.out
-
-# ===== 本地配置 =====
-settings.ini
-
-# ===== 操作系统 / 编辑器 =====
-Thumbs.db
-Desktop.ini
-.DS_Store
-*.swp
-*.swo
+# 临时文件
+*.tmp
 *~
-
-# ===== 第三方依赖（按需忽略）=====
-# lib/
-# tools/
+settings.ini
